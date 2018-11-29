@@ -31,81 +31,64 @@
  *
  ****************************************************************************/
 
-#include "px4_init.h"
+#pragma once
 
-#include <px4_config.h>
+
+#include "WorkQueueManager.hpp"
+
+#include <containers/List.hpp>
+#include <containers/Queue.hpp>
+#include <lib/perf/perf_counter.h>
 #include <px4_defines.h>
 #include <drivers/drv_hrt.h>
-#include <lib/parameters/param.h>
-#include <px4_work_queue/wq_start.h>
-#include <systemlib/cpuload.h>
 
-#include <fcntl.h>
+#define WQ_ITEM_PERF 0
 
-
-#include "platform/cxxinitialize.h"
-
-int px4_platform_init(void)
+namespace px4
 {
 
-#if defined(CONFIG_HAVE_CXX) && defined(CONFIG_HAVE_CXXINITIALIZE)
-	/* run C++ ctors before we go any further */
-	up_cxxinitialize();
+class WorkQueue; // forward declaration
+struct wq_config;
 
-#	if defined(CONFIG_SYSTEM_NSH_CXXINITIALIZE)
-#  		error CONFIG_SYSTEM_NSH_CXXINITIALIZE Must not be defined! Use CONFIG_HAVE_CXX and CONFIG_HAVE_CXXINITIALIZE.
-#	endif
+class WorkItem : public ListNode<WorkItem *>, public QueueNode<WorkItem *>
+{
 
-#else
-#  error platform is dependent on c++ both CONFIG_HAVE_CXX and CONFIG_HAVE_CXXINITIALIZE must be defined.
-#endif
+public:
 
+	WorkItem(const wq_config &config);
+	virtual ~WorkItem();
 
-#if !defined(CONFIG_DEV_CONSOLE) && defined(CONFIG_DEV_NULL)
+	bool Init(const wq_config &config);
 
-	/* Support running nsh on a board with out a console
-	 * Without this the assumption that the fd 0..2 are
-	 * std{in..err} will be wrong. NSH will read/write to the
-	 * fd it opens for the init script or nested scripts assigned
-	 * to fd 0..2.
-	 *
-	 */
+	void ScheduleNow();
 
-	int fd = open("/dev/null", O_RDWR);
+	virtual void Run() = 0;
 
-	if (fd == 0) {
-		/* Successfully opened /dev/null as stdin (fd == 0) */
+	void pre_run();
+	void post_run();
 
-		(void)fs_dupfd2(0, 1);
-		(void)fs_dupfd2(0, 2);
-		(void)fs_fdopen(0, O_RDONLY,         NULL);
-		(void)fs_fdopen(1, O_WROK | O_CREAT, NULL);
-		(void)fs_fdopen(2, O_WROK | O_CREAT, NULL);
+#if WQ_ITEM_PERF
+	void print_status() const;
+#endif /* WQ_ITEM_PERF */
 
-	} else {
-		/* We failed to open /dev/null OR for some reason, we opened
-		 * it and got some file descriptor other than 0.
-		 */
+	void set_queued_time() { _qtime = hrt_absolute_time(); }
+	const uint64_t &queued_time() { return _qtime; }
 
-		if (fd > 0) {
-			(void)close(fd);
-		}
+protected:
 
-		return -ENFILE;
-	}
+	uint64_t	_qtime{0};       // time work was queued
 
-#endif
+private:
 
-	hrt_init();
+	WorkQueue	*_wq{nullptr};
 
-	param_init();
+	volatile bool	_queued{false};	// only allow a single item to be queued at a time
 
-	/* configure CPU load estimation */
-#ifdef CONFIG_SCHED_INSTRUMENTATION
-	cpuload_initialize_once();
-#endif
+#if WQ_ITEM_PERF
+	perf_counter_t	_perf_cycle_time;
+	perf_counter_t	_perf_interval;
+	perf_counter_t	_perf_latency;
+#endif /* WQ_ITEM_PERF */
+};
 
-	wq_manager_start();
-
-	return PX4_OK;
-}
+} // namespace px4

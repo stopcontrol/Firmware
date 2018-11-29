@@ -31,81 +31,84 @@
  *
  ****************************************************************************/
 
-#include "px4_init.h"
+#include "WorkItem.hpp"
 
-#include <px4_config.h>
-#include <px4_defines.h>
+#include "WorkQueue.hpp"
+#include "WorkQueueManager.hpp"
+
+#include <px4_log.h>
 #include <drivers/drv_hrt.h>
-#include <lib/parameters/param.h>
-#include <px4_work_queue/wq_start.h>
-#include <systemlib/cpuload.h>
 
-#include <fcntl.h>
-
-
-#include "platform/cxxinitialize.h"
-
-int px4_platform_init(void)
+namespace px4
 {
 
-#if defined(CONFIG_HAVE_CXX) && defined(CONFIG_HAVE_CXXINITIALIZE)
-	/* run C++ ctors before we go any further */
-	up_cxxinitialize();
+WorkItem::WorkItem(const wq_config &config)
+{
+#if WQ_ITEM_PERF
+	_perf_cycle_time = perf_alloc(PC_ELAPSED, "wq_cycle_run_time");
+	_perf_latency = perf_alloc(PC_ELAPSED, "wq_run_latency");
+	_perf_interval = perf_alloc(PC_INTERVAL, "wq_run_interval");
+#endif /* WQ_ITEM_PERF */
 
-#	if defined(CONFIG_SYSTEM_NSH_CXXINITIALIZE)
-#  		error CONFIG_SYSTEM_NSH_CXXINITIALIZE Must not be defined! Use CONFIG_HAVE_CXX and CONFIG_HAVE_CXXINITIALIZE.
-#	endif
+	if (!Init(config)) {
+		PX4_ERR("init fail");
+	}
+}
 
-#else
-#  error platform is dependent on c++ both CONFIG_HAVE_CXX and CONFIG_HAVE_CXXINITIALIZE must be defined.
-#endif
+WorkItem::~WorkItem()
+{
+#if WQ_ITEM_PERF
+	perf_free(_perf_cycle_time);
+	perf_free(_perf_latency);
+	perf_free(_perf_interval);
+#endif /* WQ_ITEM_PERF */
+}
 
+bool WorkItem::Init(const wq_config &config)
+{
+	px4::WorkQueue *wq = work_queue_create(config);
 
-#if !defined(CONFIG_DEV_CONSOLE) && defined(CONFIG_DEV_NULL)
+	if (wq != nullptr) {
+		_wq = wq;
 
-	/* Support running nsh on a board with out a console
-	 * Without this the assumption that the fd 0..2 are
-	 * std{in..err} will be wrong. NSH will read/write to the
-	 * fd it opens for the init script or nested scripts assigned
-	 * to fd 0..2.
-	 *
-	 */
-
-	int fd = open("/dev/null", O_RDWR);
-
-	if (fd == 0) {
-		/* Successfully opened /dev/null as stdin (fd == 0) */
-
-		(void)fs_dupfd2(0, 1);
-		(void)fs_dupfd2(0, 2);
-		(void)fs_fdopen(0, O_RDONLY,         NULL);
-		(void)fs_fdopen(1, O_WROK | O_CREAT, NULL);
-		(void)fs_fdopen(2, O_WROK | O_CREAT, NULL);
-
-	} else {
-		/* We failed to open /dev/null OR for some reason, we opened
-		 * it and got some file descriptor other than 0.
-		 */
-
-		if (fd > 0) {
-			(void)close(fd);
-		}
-
-		return -ENFILE;
+		return true;
 	}
 
-#endif
-
-	hrt_init();
-
-	param_init();
-
-	/* configure CPU load estimation */
-#ifdef CONFIG_SCHED_INSTRUMENTATION
-	cpuload_initialize_once();
-#endif
-
-	wq_manager_start();
-
-	return PX4_OK;
+	return false;
 }
+
+void WorkItem::ScheduleNow()
+{
+	if (_wq != nullptr && !_queued) {
+		_queued = true;
+		_wq->Add(this);
+	}
+};
+
+void WorkItem::pre_run()
+{
+	_queued = false;
+#if WQ_ITEM_PERF
+	perf_set_elapsed(_perf_latency, hrt_elapsed_time(&_qtime));
+	perf_count(_perf_interval);
+	perf_begin(_perf_cycle_time);
+#endif /* WQ_ITEM_PERF */
+}
+
+void WorkItem::post_run()
+{
+#if WQ_ITEM_PERF
+	perf_end(_perf_cycle_time);
+#endif /* WQ_ITEM_PERF */
+}
+
+#if WQ_ITEM_PERF
+void WorkItem::print_status() const
+{
+	perf_print_counter(_perf_cycle_time);
+	perf_print_counter(_perf_interval);
+	perf_print_counter(_perf_latency);
+}
+#endif /* WQ_ITEM_PERF */
+
+} // namespace px4
